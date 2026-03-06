@@ -171,6 +171,6 @@ export OPENAI_API_KEY=dummy
 
 ## Current Status
 
-Implemented: local proxy routing, P2P circle networking, credit pooling with grant protocol, ledger tracking with gossipsub replication, weekly schedule controls, Phase 4.5 security hardening, and a compact dark-themed UI.
+Implemented: local proxy routing, P2P circle networking, credit pooling with grant protocol, ledger tracking with gossipsub replication, weekly schedule controls, security hardening, and a compact dark-themed UI.
 
 In progress: OAuth automation refinements and additional operational tooling.
