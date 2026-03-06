@@ -1,141 +1,176 @@
 # TokenUnion
 
-TokenUnion is a desktop app for small friend circles that use AI coding tools. It helps the group share API credits in a practical way. If one person is sleeping and not using their credits, another person in a different time zone can borrow through the circle.
+A peer-to-peer desktop application for cooperative API credit pooling across trusted circles. Built with Tauri 2, React, and libp2p.
 
-The app is local first. Your keys stay on your own machine. The app runs as a local proxy and coordinates with trusted peers in your circle.
+TokenUnion runs as a local proxy that intercepts API calls, coordinates with peers via encrypted P2P messaging, and routes requests through available members — enabling small groups to share idle API credits across time zones without exposing keys.
 
-## What problem this solves
+## Problem
 
-Many people pay for API usage but do not use all of it every day. Credits reset and unused value is lost. Also, friends working in different time zones are rarely active at the same time.
+API subscriptions bill monthly but usage is bursty. Credits go unused while you sleep, and reset before peers in other time zones can benefit. There is no mechanism to share surplus capacity within a trusted group without centralizing keys on a third-party service.
 
-TokenUnion solves this by routing requests through available peers only when needed. It tracks lending and borrowing so the group can stay fair.
+## Architecture
 
-## Why this design was chosen
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         TokenUnion Desktop                         │
+│                                                                     │
+│  ┌──────────────────────┐       ┌────────────────────────────────┐  │
+│  │     React Frontend   │       │        Tauri / Rust Backend    │  │
+│  │                      │       │                                │  │
+│  │  ┌────────────────┐  │       │  ┌──────────┐  ┌───────────┐  │  │
+│  │  │  Dashboard     │  │ IPC   │  │  Vault   │  │  Tracker  │  │  │
+│  │  │  Circle        │◄─┼───────┼─►│ (age +   │  │ (token    │  │  │
+│  │  │  Ledger        │  │ Tauri │  │  PBKDF2) │  │  counting)│  │  │
+│  │  │  Vault         │  │ cmds  │  └──────────┘  └───────────┘  │  │
+│  │  │  Schedule      │  │       │                                │  │
+│  │  │  Settings      │  │       │  ┌──────────┐  ┌───────────┐  │  │
+│  │  │  Onboarding    │  │       │  │  SQLite  │  │   Proxy   │  │  │
+│  │  └────────────────┘  │       │  │  (db.rs) │  │ :47821    │  │  │
+│  │                      │       │  └──────────┘  └─────┬─────┘  │  │
+│  │  Zustand state mgmt  │       │                      │        │  │
+│  │  Recharts viz        │       │  ┌───────────────────┴──────┐ │  │
+│  └──────────────────────┘       │  │      libp2p Swarm       │ │  │
+│                                 │  │  TCP + Noise + Yamux     │ │  │
+│                                 │  │  mDNS · Relay · Dcutr   │ │  │
+│                                 │  │  Gossipsub · Req/Res    │ │  │
+│                                 │  └────────────┬────────────┘ │  │
+│                                 └───────────────┼──────────────┘  │
+└─────────────────────────────────────────────────┼─────────────────┘
+                                                  │
+                      ┌───────────────────────────┼──────────────────┐
+                      │                           │                  │
+               ┌──────▼──────┐            ┌───────▼───────┐   ┌─────▼─────┐
+               │  Peer Node  │            │  Peer Node    │   │   Relay   │
+               │  (same LAN  │            │  (remote,     │   │  (Go,     │
+               │   via mDNS) │            │   via relay)  │   │  libp2p)  │
+               └─────────────┘            └───────────────┘   └───────────┘
+```
 
-TokenUnion is built as a desktop app because key security matters. The app does not need a central cloud service to hold secrets.
+### Request Routing Flow
 
-The design uses peer to peer networking so your friend circle is the trust boundary. This means the system still works when internet services are unreliable, and private data does not need to sit on a third party backend.
+```
+  Developer Tool (Claude Code, Codex, etc.)
+        │
+        │  HTTP request to localhost:47821
+        ▼
+  ┌─────────────┐
+  │  Local Proxy │
+  │  (axum)      │
+  └──────┬──────┘
+         │
+         ▼
+  ┌──────────────────┐     YES     ┌──────────────────┐
+  │ Local key         ├────────────►│ Forward to        │
+  │ available?        │             │ upstream API      │
+  └───────┬──────────┘             └────────┬─────────┘
+          │ NO                              │
+          ▼                                 ▼
+  ┌──────────────────┐             ┌──────────────────┐
+  │ Broadcast grant   │             │ Track tokens,     │
+  │ request to peers  │             │ log to ledger     │
+  └───────┬──────────┘             └──────────────────┘
+          │
+          ▼
+  ┌──────────────────┐
+  │ Peer executes     │
+  │ request with      │
+  │ their own key     │
+  └───────┬──────────┘
+          │
+          ▼
+  ┌──────────────────┐
+  │ Response relayed  │
+  │ back via P2P      │
+  └──────────────────┘
+```
 
-## Architecture in simple words
+## Security Model
 
-TokenUnion has four main parts.
+| Property | Implementation |
+|---|---|
+| Key storage | Encrypted at rest via `age` + PBKDF2-derived passphrase |
+| Key isolation | API keys never leave the local machine; peers proxy requests, not credentials |
+| Message authentication | All P2P messages signed with ed25519 keypairs |
+| Replay protection | Nonce + ±30s timestamp window per request |
+| Rate limiting | Per-peer configurable request limits with sliding window |
+| Content privacy | Prompt/response payloads are never persisted to local telemetry or audit tables |
+| Ledger integrity | Transactions include SHA-256 request hashes; replicated via gossipsub |
+| Relay trust model | Relays are metadata-aware but content-blind (Noise encryption) |
 
-1. Frontend app
+See [SECURITY.md](SECURITY.md) for the full threat model and mitigation details.
 
-This is the interface you see. It is made with React. It handles onboarding, dashboard, vault, schedule, ledger, and settings.
+## Tech Stack
 
-2. Local backend inside the desktop app
+| Layer | Technology |
+|---|---|
+| Frontend | React 18, TypeScript, Tailwind CSS, Zustand, Recharts |
+| Desktop shell | Tauri 2 (Rust) |
+| HTTP proxy | Axum + Reqwest |
+| P2P networking | rust-libp2p (TCP, Noise, Yamux, mDNS, Relay, Dcutr, Gossipsub, Request-Response) |
+| Storage | SQLite via rusqlite (bundled) |
+| Encryption | age, AES-GCM, PBKDF2, SHA-256 |
+| Relay server | Go + go-libp2p |
+| CI/CD | GitHub Actions |
 
-This is written in Rust and runs in Tauri. It stores local data in SQLite, manages encryption, runs background jobs, and exposes commands to the frontend.
+## Project Structure
 
-3. Local proxy
+```
+├── src/                    # React frontend
+│   ├── pages/              #   Dashboard, Circle, Ledger, Vault, Schedule, Settings, Onboarding
+│   ├── components/         #   Layout, Nav, TrayPopover
+│   ├── stores/             #   Zustand app store
+│   └── styles/             #   Tailwind globals
+├── src-tauri/              # Rust backend
+│   └── src/
+│       ├── main.rs         #   Tauri command bridge
+│       ├── db.rs           #   SQLite schema + queries
+│       ├── p2p.rs          #   libp2p swarm, protocols, messaging
+│       ├── proxy.rs        #   Local HTTP proxy (axum)
+│       ├── tracker.rs      #   Token usage accounting
+│       └── vault.rs        #   Key encryption/decryption
+├── relay/                  # Go relay server
+│   └── main.go
+└── .github/workflows/      # CI/CD pipeline
+```
 
-Your tools call `http://localhost:47821`. TokenUnion receives the request, decides whether to use your own key or a peer key, forwards the request, and returns the response.
+## Getting Started
 
-4. Peer to peer network
+### Prerequisites
 
-Circle members connect through libp2p. On the same network, peers can discover each other automatically. Across networks, a relay can help connect peers. Message content is encrypted in transit.
+- Node.js 20+
+- Rust toolchain via [rustup](https://rustup.rs) (`cargo` must be in `$PATH`)
 
-## Security model in plain English
-
-TokenUnion is designed around these rules.
-
-1. API keys are encrypted at rest.
-
-2. API keys are never sent to other peers.
-
-3. Token requests are signed and checked.
-
-4. Replay attempts are rejected using nonce and time window checks.
-
-5. Per peer rate limits are enforced.
-
-6. Prompt and response content is not persisted to local telemetry tables.
-
-7. Circle key material is encrypted locally and used for encrypted ledger gossip.
-
-8. Relay nodes are treated as metadata exposed but content blind.
-
-For deeper details, read `SECURITY.md`.
-
-## Product flow
-
-1. Install and open TokenUnion.
-
-2. Complete onboarding.
-
-3. Add your API keys in Vault or connect Anthropic OAuth.
-
-4. Create or join a circle.
-
-5. Set your sharing schedule.
-
-6. Point your tools to the local proxy.
-
-7. Work normally while TokenUnion routes and tracks usage.
-
-## How routing works
-
-When a request comes in, TokenUnion checks if your local key is available.
-
-If available, it uses your local key.
-
-If not available, it asks online peers for a grant.
-
-The first valid grant is used.
-
-The chosen peer makes the upstream API call on their own machine.
-
-The response comes back to you.
-
-Both sides store metadata for ledger and audit purposes.
-
-## Tech stack
-
-Frontend uses React, TypeScript, Tailwind, and Zustand.
-
-Desktop backend uses Tauri 2 and Rust.
-
-Proxy uses axum and reqwest.
-
-Peer networking uses rust libp2p with TCP, Noise, Yamux, mDNS, relay, dcutr, request response, and gossipsub.
-
-Storage uses SQLite through rusqlite.
-
-Encryption uses age plus PBKDF2 based derivation for protected local data.
-
-## Local development setup
-
-Install Node.js 20 or newer.
-
-Install Rust using rustup and make sure `cargo` is available.
-
-Run:
+### Development
 
 ```bash
 npm install
 npm run tauri dev
 ```
 
-If you get an error that says `cargo metadata` is missing, Rust is not installed correctly or not in your shell path.
+### Proxy Configuration
 
-## Proxy quick start
-
-For Anthropic tools:
+Point your AI tools at the local proxy:
 
 ```bash
+# Anthropic (Claude Code, etc.)
 export ANTHROPIC_BASE_URL=http://localhost:47821
-```
 
-For OpenAI or Codex tools:
-
-```bash
+# OpenAI-compatible (Codex, etc.)
 export OPENAI_BASE_URL=http://localhost:47821
 export OPENAI_API_KEY=dummy
 ```
 
-## Current status
+## Usage
 
-This project includes local proxying, circle networking, credit pooling, ledger tracking, schedule controls, security hardening, and a redesigned compact UI.
+1. Launch TokenUnion and complete onboarding (identity, keys, circle, schedule).
+2. Add API keys in **Vault** or authenticate via Anthropic OAuth (PKCE).
+3. Create or join a **Circle** using an invite link.
+4. Configure your **Schedule** — a 7×24 weekly availability grid controlling when your credits are shared.
+5. Set your tool's base URL to the local proxy.
+6. Use your tools as normal. TokenUnion handles routing, peer coordination, and ledger tracking transparently.
 
-Some advanced pieces are still improving over time, such as smoother OAuth automation and additional operational tooling.
+## Current Status
+
+Implemented: local proxy routing, P2P circle networking, credit pooling with grant protocol, ledger tracking with gossipsub replication, weekly schedule controls, Phase 4.5 security hardening, and a compact dark-themed UI.
+
+In progress: OAuth automation refinements and additional operational tooling.
